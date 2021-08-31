@@ -26,26 +26,29 @@ contract Strategy is BaseStrategy {
 
     bytes32 public POOL_ID =
         0xfeadd389a5c427952d8fdb8057d6c8ba1156cc56000000000000000000000066;
+    IERC20 public POOL = IERC20(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
     IVault public BAL_VAULT =
         IVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
 
-    constructor(address _vault) public BaseStrategy(_vault) {
-        // You can set these parameters on deployment to whatever you want
-        // maxReportDelay = 6300;
-        // profitFactor = 100;
-        // debtThreshold = 0;
-    }
+    constructor(address _vault) public BaseStrategy(_vault) {}
 
     // ******** OVERRIDE THESE METHODS FROM BASE CONTRACT ************
 
+    function balanceOfWant() public view returns (uint256) {
+        return want.balanceOf(address(this));
+    }
+
+    function balanceOfPool() public view returns (uint256) {
+        return POOL.balanceOf(address(this));
+    }
+
     function name() external view override returns (string memory) {
-        // Add your own name here, suggestion e.g. "StrategyCreamYFI"
         return "Strategy-Balancer-wBTC";
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
-        // TODO: Build a more accurate estimate using the value of all positions in terms of `want`
-        return want.balanceOf(address(this));
+        // assume that pool token has similar value to want
+        return balanceOfWant() + balanceOfPool();
     }
 
     function prepareReturn(uint256 _debtOutstanding)
@@ -66,26 +69,28 @@ contract Strategy is BaseStrategy {
     }
 
     function adjustPosition(uint256 _debtOutstanding) internal override {
-        // TODO: Do something to invest excess `want` tokens (from the Vault) into your positions
-        // NOTE: Try to adjust positions so that `_debtOutstanding` can be freed up on *next* harvest (not immediately)
-        // Take any wBTC, invest in
-        uint256 toDeposit = want.balanceOf(address(this));
+        uint256 wantBalance = balanceOfWant();
 
+        // do not invest if we have more debt than want
+        if (_debtOutstanding > wantBalance) {
+            return;
+        }
+
+        uint256 toDeposit = wantBalance.sub(_debtOutstanding);
         (IAsset[] memory tokens, , ) = BAL_VAULT.getPoolTokens(POOL_ID);
-
-        //NOTE: Still have to verify ordering of assets is correct
-        bytes memory userData =
-            abi.encode(
-                IVault.JoinKind.EXACT_TOKENS_IN_FOR_BPT_OUT,
-                [toDeposit, 0, 0],
-                0
-            );
-        // Note 0 can be frontrun for a bad outcome
+        require(address(tokens[0]) == address(want));
 
         uint256[] memory amounts = new uint256[](3);
         amounts[0] = toDeposit;
         amounts[1] = 0;
         amounts[2] = 0;
+
+        bytes memory userData =
+            abi.encode(
+                IVault.JoinKind.EXACT_TOKENS_IN_FOR_BPT_OUT,
+                amounts,
+                0 // Note 0 can be frontrun for a bad outcome
+            );
 
         IVault.JoinPoolRequest memory req =
             IVault.JoinPoolRequest({
@@ -103,27 +108,43 @@ contract Strategy is BaseStrategy {
         override
         returns (uint256 _liquidatedAmount, uint256 _loss)
     {
-        // TODO: Do stuff here to free up to `_amountNeeded` from all positions back into `want`
-        // NOTE: Maintain invariant `want.balanceOf(this) >= _liquidatedAmount`
-        // NOTE: Maintain invariant `_liquidatedAmount + _loss <= _amountNeeded`
+        uint256 wantBalance = balanceOfWant();
+        if (wantBalance < _amountNeeded) {
+            _withdrawSome(_amountNeeded.sub(wantBalance));
+        }
 
-        // We would need to check how much to withdraw
-        // But generally speaking we want to get out the exact amount
+        wantBalance = balanceOfWant();
+        if (_amountNeeded > wantBalance) {
+            _liquidatedAmount = wantBalance;
+            _loss = _amountNeeded.sub(wantBalance);
+        } else {
+            _liquidatedAmount = _amountNeeded;
+        }
+    }
 
-        bytes memory userData =
-            abi.encode(
-                IVault.ExitKind.BPT_IN_FOR_EXACT_TOKENS_OUT,
-                [_amountNeeded, 0, 0],
-                type(uint256).max
-            );
-        //NOTE: Probably a bad idea to do max
+    function liquidateAllPositions() internal override returns (uint256) {
+        return _withdrawSome(type(uint256).max);
+    }
+
+    function _withdrawSome(uint256 _amount) internal returns (uint256) {
+        uint256 balanceOfWantBefore = balanceOfWant();
 
         (IAsset[] memory tokens, , ) = BAL_VAULT.getPoolTokens(POOL_ID);
+        require(address(tokens[0]) == address(want));
 
         uint256[] memory amounts = new uint256[](3);
         amounts[0] = _amountNeeded;
         amounts[1] = 0;
         amounts[2] = 0;
+
+        // We would need to check how much to withdraw
+        // But generally speaking we want to get out the exact amount
+        bytes memory userData =
+            abi.encode(
+                IVault.ExitKind.BPT_IN_FOR_EXACT_TOKENS_OUT,
+                amounts,
+                balanceOfPool()
+            );
 
         IVault.ExitPoolRequest memory req =
             IVault.ExitPoolRequest({
@@ -135,27 +156,14 @@ contract Strategy is BaseStrategy {
 
         BAL_VAULT.exitPool(POOL_ID, address(this), payable(address(this)), req);
 
-        uint256 totalAssets = want.balanceOf(address(this));
-        if (_amountNeeded > totalAssets) {
-            _liquidatedAmount = totalAssets;
-            _loss = _amountNeeded.sub(totalAssets);
-        } else {
-            _liquidatedAmount = _amountNeeded;
-        }
-    }
-
-    function liquidateAllPositions() internal override returns (uint256) {
-        // TODO: Liquidate all positions and return the amount freed.
-        return want.balanceOf(address(this));
+        return balanceOfWant().sub(balanceOfWantBefore);
     }
 
     // NOTE: Can override `tendTrigger` and `harvestTrigger` if necessary
 
     function prepareMigration(address _newStrategy) internal override {
-        // TODO: Transfer any non-`want` tokens to the new strategy
         // NOTE: `migrate` will automatically forward all `want` in this strategy to the new one
-        // Send BPT to new strategy
-        // Send want to new strategy
+        POOL.transfer(_newStrategy, balanceOfPool());
     }
 
     // Override this to add all tokens/tokenized positions this contract manages
@@ -177,7 +185,9 @@ contract Strategy is BaseStrategy {
         override
         returns (address[] memory)
     {
-        // BPT is protected
+        address[] memory protected = new address[](1);
+        protected[0] = address(POOL);
+        return protected;
     }
 
     /**
