@@ -1,0 +1,2 @@
+import { claimRewards } from "./claim";
+
